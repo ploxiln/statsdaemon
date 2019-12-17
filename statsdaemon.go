@@ -21,7 +21,6 @@ import (
 
 const (
 	MAX_UNPROCESSED_PACKETS = 1000
-	TCP_READ_SIZE           = 4096
 )
 
 var signalchan chan os.Signal
@@ -91,6 +90,7 @@ var (
 	serviceAddress    = flag.String("address", ":8125", "UDP service address")
 	tcpServiceAddress = flag.String("tcpaddr", "", "TCP service address, if set")
 	maxUdpPacketSize  = flag.Int("max-udp-packet-size", 1472, "Maximum UDP packet size")
+	maxTcpReadSize    = flag.Int("max-tcp-read-size", 2000, "Maximum TCP read size")
 	graphiteAddress   = flag.String("graphite", "127.0.0.1:2003", "Graphite service address (or - to disable)")
 	flushInterval     = flag.Int64("flush-interval", 10, "Flush interval (seconds)")
 	debug             = flag.Bool("debug", false, "print statistics sent to graphite")
@@ -99,6 +99,8 @@ var (
 	persistCountKeys  = flag.Uint("persist-count-keys", 60, "number of flush-intervals to persist count keys (at zero)")
 	persistTimerKeys  = flag.Uint("persist-timer-counts", 0, "number of flush-intervals to persist timer count keys (at zero)")
 	receiveCounter    = flag.String("receive-counter", "", "Metric name for total metrics received per interval")
+	udpReadCounter    = flag.String("udp-read-counter", "", "Metric name for total udp packets received per interval")
+	tcpReadCounter    = flag.String("tcp-read-counter", "", "Metric name for total tcp reads done per interval")
 	percentThreshold  = Percentiles{}
 	prefix            = flag.String("prefix", "", "Prefix for all stats")
 	postfix           = flag.String("postfix", "", "Postfix for all stats")
@@ -110,7 +112,9 @@ func init() {
 }
 
 var (
-	receiveCount    uint64
+	receiveCount    uint
+	udpReadCount    uint
+	tcpReadCount    uint
 	In              = make(chan *Packet, MAX_UNPROCESSED_PACKETS)
 	counters        = make(map[string]float64)
 	gauges          = make(map[string]float64)
@@ -228,19 +232,31 @@ func submit(deadline time.Time) error {
 	return nil
 }
 
+type builtinCounter struct {
+	name *string
+	val  *uint
+}
+
 func processCounters(buffer *bytes.Buffer, now int64) int64 {
 	var num int64
 	persist := *persistCountKeys
 
-	// avoid adding prefix/postfix to receiveCounter
-	if *receiveCounter != "" && receiveCount > 0 {
-		fmt.Fprintf(buffer, "%s %d %d\n", *receiveCounter, receiveCount, now)
-		if persist > 0 {
-			inactivCounters[*receiveCounter] = 0
-		}
-		num++
+	// avoid adding prefix/postfix to builtin counters
+	builtins := []builtinCounter{
+		{receiveCounter, &receiveCount},
+		{udpReadCounter, &udpReadCount},
+		{tcpReadCounter, &tcpReadCount},
 	}
-	receiveCount = 0
+	for _, b := range builtins {
+		if *b.name != "" && *b.val > 0 {
+			fmt.Fprintf(buffer, "%s %d %d\n", *b.name, *b.val, now)
+			if persist > 0 {
+				inactivCounters[*b.name] = 0
+			}
+			num++
+		}
+		*b.val = 0
+	}
 
 	for bucket, value := range counters {
 		fullbucket := *prefix + bucket + *postfix
@@ -388,7 +404,7 @@ type MsgParser struct {
 func NewParser(reader io.Reader, partialReads bool) *MsgParser {
 	bufsz := *maxUdpPacketSize
 	if partialReads {
-		bufsz = TCP_READ_SIZE
+		bufsz = *maxTcpReadSize
 	}
 	newbuf := make([]byte, bufsz)
 	return &MsgParser{reader, newbuf, newbuf[:0], partialReads, false}
@@ -414,9 +430,9 @@ func (mp *MsgParser) Next() (*Packet, bool) {
 
 		// for udp, each message independent
 		// for tcp, copy to front and append
-		// unless no '\n' in entire TCP_READ_SIZE
+		// unless no '\n' in entire max-tcp-read-size
 		idx := 0
-		if mp.partialReads && len(buf) < TCP_READ_SIZE {
+		if mp.partialReads && len(buf) < *maxTcpReadSize {
 			idx = len(buf)
 			copy(mp.newbuf, buf)
 		}
@@ -429,6 +445,13 @@ func (mp *MsgParser) Next() (*Packet, bool) {
 				log.Printf("ERROR: %s", err)
 			}
 			mp.done = true
+		}
+		if n > 0 {
+			if mp.partialReads {
+				tcpReadCount++
+			} else {
+				udpReadCount++
+			}
 		}
 	}
 }
@@ -544,19 +567,17 @@ func logParseFail(line []byte) {
 }
 
 func parseTo(conn io.ReadCloser, partialReads bool, out chan<- *Packet) {
-	defer conn.Close()
-
 	parser := NewParser(conn, partialReads)
 	for {
 		p, more := parser.Next()
 		if p != nil {
 			out <- p
 		}
-
 		if !more {
 			break
 		}
 	}
+	conn.Close()
 }
 
 func udpListener() {
