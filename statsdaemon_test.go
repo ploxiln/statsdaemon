@@ -372,9 +372,9 @@ func TestPacketHandlerReceiveCounter(t *testing.T) {
 		Sampling: float32(1),
 	}
 	packetHandler(p)
-	assert.Equal(t, receiveCount, uint(1))
+	assert.Equal(t, receiveCount, uint32(1))
 	packetHandler(p)
-	assert.Equal(t, receiveCount, uint(2))
+	assert.Equal(t, receiveCount, uint32(2))
 
 	flag.Set("receive-counter", "")
 }
