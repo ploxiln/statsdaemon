@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -112,9 +113,9 @@ func init() {
 }
 
 var (
-	receiveCount    uint
-	udpReadCount    uint
-	tcpReadCount    uint
+	receiveCount    uint32
+	udpReadCount    uint32
+	tcpReadCount    uint32
 	In              = make(chan *Packet, MAX_UNPROCESSED_PACKETS)
 	counters        = make(map[string]float64)
 	gauges          = make(map[string]float64)
@@ -146,7 +147,7 @@ func monitor() {
 }
 
 func packetHandler(s *Packet) {
-	receiveCount++
+	receiveCount++ // atomic not needed, same goroutine as submit()
 
 	switch s.Modifier {
 	case "ms":
@@ -234,7 +235,7 @@ func submit(deadline time.Time) error {
 
 type builtinCounter struct {
 	name *string
-	val  *uint
+	val  uint32
 }
 
 func processCounters(buffer *bytes.Buffer, now int64) int64 {
@@ -243,19 +244,18 @@ func processCounters(buffer *bytes.Buffer, now int64) int64 {
 
 	// avoid adding prefix/postfix to builtin counters
 	builtins := []builtinCounter{
-		{receiveCounter, &receiveCount},
-		{udpReadCounter, &udpReadCount},
-		{tcpReadCounter, &tcpReadCount},
+		{receiveCounter, atomic.SwapUint32(&receiveCount, 0)},
+		{udpReadCounter, atomic.SwapUint32(&udpReadCount, 0)},
+		{tcpReadCounter, atomic.SwapUint32(&tcpReadCount, 0)},
 	}
 	for _, b := range builtins {
-		if *b.name != "" && *b.val > 0 {
-			fmt.Fprintf(buffer, "%s %d %d\n", *b.name, *b.val, now)
+		if *b.name != "" && b.val > 0 {
+			fmt.Fprintf(buffer, "%s %d %d\n", *b.name, b.val, now)
 			if persist > 0 {
 				inactivCounters[*b.name] = 0
 			}
 			num++
 		}
-		*b.val = 0
 	}
 
 	for bucket, value := range counters {
@@ -448,9 +448,9 @@ func (mp *MsgParser) Next() (*Packet, bool) {
 		}
 		if n > 0 {
 			if mp.partialReads {
-				tcpReadCount++
+				atomic.AddUint32(&tcpReadCount, 1)
 			} else {
-				udpReadCount++
+				atomic.AddUint32(&udpReadCount, 1)
 			}
 		}
 	}
